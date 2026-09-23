@@ -1,47 +1,98 @@
 // Package plant is the local simulated actuator and encoder: a per-axis
-// double integrator with deterministic fixed-step integration.
+// double integrator (inertia load + optional constant gravity bias) with
+// deterministic semi-implicit Euler integration on a fixed time step.
+//
+// The plant itself never saturates torque or hides faults; commanded torque
+// saturation and fault detection live in the controller/engine. An encoder
+// can be marked invalid to deterministically simulate feedback loss.
 package plant
+
+import "github.com/h3yow/robot-motion-controller-go/internal/motion/kinematics"
 
 // EncoderReading is one control cycle's encoder feedback.
 type EncoderReading struct {
 	Position []float64 // measured joint position (rad)
 	Velocity []float64 // measured joint velocity (rad/s)
-	// Valid is false to simulate feedback loss; in that case Position and
-	// Velocity must not be trusted.
+	// Valid is false to simulate feedback loss; Position/Velocity are then
+	// nil and must not be trusted.
 	Valid bool
 }
 
 // Sim is the simulated multi-axis plant.
 type Sim struct {
-	period    float64
-	n         int
-	position  []float64
-	velocity  []float64
-	inertia   []float64
-	gravity   []float64
+	period     float64
+	n          int
+	position   []float64
+	velocity   []float64
+	inertia    []float64
+	gravity    []float64
 	feedbackOK bool
 }
 
-// New creates a simulator for n axes with the given fixed period (s),
-// inertia (kg*m^2) and gravity torque bias (N*m).
+// New creates a simulator. period is the fixed step (s), inertia is per axis
+// (kg*m^2, strictly positive), gravity an optional constant torque bias
+// (N*m per axis, nil means zero).
 func New(period float64, inertia, gravity []float64) *Sim {
-	return &Sim{}
+	n := len(inertia)
+	s := &Sim{
+		period:     period,
+		n:          n,
+		position:   make([]float64, n),
+		velocity:   make([]float64, n),
+		inertia:    append([]float64(nil), inertia...),
+		gravity:    make([]float64, n),
+		feedbackOK: true,
+	}
+	if gravity != nil {
+		copy(s.gravity, gravity)
+	}
+	return s
 }
 
 // Reset places the plant at the given joint state.
-func (s *Sim) Reset(position, velocity []float64) {}
-
-// Step integrates one control cycle under the applied torques (N*m) and an
-// additive deterministic disturbance torque (N*m, use 0 for none).
-func (s *Sim) Step(torque, disturbance []float64) EncoderReading {
-	return EncoderReading{}
+func (s *Sim) Reset(position, velocity []float64) {
+	copy(s.position, position)
+	copy(s.velocity, velocity)
+	s.feedbackOK = true
 }
 
-// SetFeedbackValid simulates encoder connection/disconnection.
-func (s *Sim) SetFeedbackValid(ok bool) {}
+// Step integrates one fixed control cycle. torque is the actuator torque
+// (N*m), disturbance an optional additive deterministic torque (N*m, nil
+// means zero). It returns the encoder reading taken after the update.
+func (s *Sim) Step(torque, disturbance []float64) EncoderReading {
+	d := make([]float64, s.n)
+	if disturbance != nil {
+		copy(d, disturbance)
+	}
+	for i := 0; i < s.n; i++ {
+		net := torque[i] + s.gravity[i] + d[i]
+		acc := net / s.inertia[i]
+		// Semi-implicit Euler: velocity first, then position. Deterministic
+		// and stable for the stiff PID case at fixed dt.
+		s.velocity[i] += acc * s.period
+		s.position[i] += s.velocity[i] * s.period
+	}
+	if !s.feedbackOK {
+		return EncoderReading{Valid: false}
+	}
+	return EncoderReading{
+		Valid:    true,
+		Position: append([]float64(nil), s.position...),
+		Velocity: append([]float64(nil), s.velocity...),
+	}
+}
+
+// SetFeedbackValid simulates encoder connection (true) / loss (false).
+func (s *Sim) SetFeedbackValid(ok bool) { s.feedbackOK = ok }
+
+// FeedbackValid reports current encoder link state.
+func (s *Sim) FeedbackValid() bool { return s.feedbackOK }
 
 // Position returns a copy of the simulated position.
-func (s *Sim) Position() []float64 { return nil }
+func (s *Sim) Position() []float64 { return append([]float64(nil), s.position...) }
 
 // Velocity returns a copy of the simulated velocity.
-func (s *Sim) Velocity() []float64 { return nil }
+func (s *Sim) Velocity() []float64 { return append([]float64(nil), s.velocity...) }
+
+// checkFinite is used by tests/diagnostics.
+func checkFinite(xs []float64) bool { return kinematics.IsFinite(xs...) }
