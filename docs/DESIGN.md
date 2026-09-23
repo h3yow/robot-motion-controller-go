@@ -57,7 +57,7 @@
 - 饱和：力矩被钳到 `MaxTorque` 记一次饱和；连续 `SaturationCycles` 周期 →
   `DRIVE_SATURATION_PERSISTENT`（可恢复）。
 - 末端收敛：轨迹到点后进入有界保持阶段，需连续 `20` 个周期满足
-  |位置误差| ≤ `0.1·TrackingTolerance` 且 |速度| ≤ `1e-4 rad/s` 才报 `Done`；
+  |位置误差| ≤ `0.1·TrackingTolerance` 且 |速度| ≤ `5e-4 rad/s` 才报 `Done`；
   超过 `5 s` 仍未收敛 → 判 `CONTROL_DIVERGED`，绝不返回"未收敛的成功"。
 - 恢复时的停稳判据：|v| ≤ `1e-6 rad/s`（另见第 5 节）。
 

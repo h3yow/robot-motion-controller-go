@@ -74,8 +74,6 @@ type Controller struct {
 	n   int
 	// per-axis PID memory
 	integral []float64
-	prevErr  []float64
-	hasPrev  bool
 	// per-axis consecutive saturated cycle count
 	satCycles []int
 }
@@ -87,7 +85,6 @@ func New(cfg *config.Config) *Controller {
 		cfg:       cfg,
 		n:         n,
 		integral:  make([]float64, n),
-		prevErr:   make([]float64, n),
 		satCycles: make([]int, n),
 	}
 }
@@ -96,10 +93,8 @@ func New(cfg *config.Config) *Controller {
 func (c *Controller) Reset() {
 	for i := range c.integral {
 		c.integral[i] = 0
-		c.prevErr[i] = 0
 		c.satCycles[i] = 0
 	}
-	c.hasPrev = false
 }
 
 func clamp(x, lim float64) float64 {
@@ -168,12 +163,12 @@ func (c *Controller) Step(cmd trajectory.Point, fb plant.EncoderReading) (torque
 		if lim := c.cfg.Controller.IntegralWindup; lim > 0 {
 			newIntegral = clamp(newIntegral, lim)
 		}
-		dErr := errP
-		if c.hasPrev {
-			dErr = (errP - c.prevErr[i]) / dt
-		}
-		pid := c.cfg.Controller.Kp*errP + c.cfg.Controller.Ki*newIntegral + c.cfg.Controller.Kd*(dErr)
-		raw := ff + pid
+		// Derivative action: for a regulator this equals damping against the
+		// CURRENT measured velocity error (v_cmd - v_fb); using a differenced
+		// position error would reintroduce a one-sample measurement lag and
+		// weaken damping by roughly a factor of dt.
+		raw := ff + c.cfg.Controller.Kp*errP + c.cfg.Controller.Ki*newIntegral +
+			c.cfg.Controller.Kd*(cmd.Velocity[i]-fb.Velocity[i])
 		t := clamp(raw, axis.MaxTorque)
 		sat := raw != t
 		if !sat {
@@ -200,9 +195,7 @@ func (c *Controller) Step(cmd trajectory.Point, fb plant.EncoderReading) (torque
 					absErr, tol, cmd.Position[i], fb.Position[i]))
 		}
 
-		c.prevErr[i] = errP
 	}
-	c.hasPrev = true
 	return torque, saturated, nil
 }
 

@@ -263,3 +263,61 @@ func stopped(s engine.Snapshot) bool {
 	}
 	return true
 }
+
+// TestClosedLoopCorrectsDisturbance proves the feedback loop rejects a
+// moderate constant disturbance that stays inside torque/tolerance bounds:
+// the motion still converges rather than drifting or faulting.
+func TestClosedLoopCorrectsDisturbance(t *testing.T) {
+	mt := mctest.Wrap(t)
+	c := testCfg()
+	// Faster integral action (Ki=40, windup clamp 20 N*m) makes the loop
+	// cancel a moderate constant load well within the settle budget; torque
+	// headroom stays ample (load 0.5 vs cap 60).
+	c.Controller.Ki = 40
+	c.Controller.IntegralWindup = 20
+	e := engine.New(c)
+	e.SetDisturbance([]float64{0.5, -0.4})
+	_, err := e.Submit(move("ui", 1, 0, 1, 0.5))
+	mt.CheckNoErr("submit", "goal {1,0.5} + disturbance", err)
+	r := e.Run()
+	mt.CheckTrue("converged under disturbance", "const torque 0.5,-0.4",
+		r.Done && r.Fault == nil, "expected closed-loop correction, state="+string(r.State))
+	s := e.Snapshot()
+	mt.CheckApprox("axis0 holds goal despite load", "disturbance", s.Axes[0].PositionActual, 1, 0.005)
+	mt.CheckApprox("axis1 holds goal despite load", "disturbance", s.Axes[1].PositionActual, 0.5, 0.005)
+}
+
+// TestTorqueRejectedAtEngine ensures a goal needing more than MaxTorque is
+// refused at the engine entry with the distinct torque reason and never moves.
+func TestTorqueRejectedAtEngine(t *testing.T) {
+	mt := mctest.Wrap(t)
+	c := testCfg()
+	// With inertia 1 and MaxAccel 10 the peak inertial torque is 10; cap
+	// MaxTorque below the gravity+inertial need so planning must reject.
+	c.Axes[0].MaxTorque = 5
+	e := engine.New(c)
+	_, err := e.Submit(move("ui", 1, 0, 1, 0))
+	mt.CheckReason("torque infeasible", "MaxTorque=5, need=10", err, classify.ReasonTorqueLimit)
+	mt.CheckEq("no motion after torque reject", "rejected", e.State(), engine.StateIdle)
+}
+
+// TestCancelWrongTargetDoesNotCancel verifies a mismatched cancel is
+// rejected and the active command keeps executing (no state rollback).
+func TestCancelWrongTargetKeepsRunning(t *testing.T) {
+	mt := mctest.Wrap(t)
+	e := engine.New(testCfg())
+	_, err := e.Submit(move("ui", 1, 1, 1, 1))
+	mt.CheckNoErr("submit", "ui#1", err)
+	for k := 0; k < 20; k++ {
+		e.Step()
+	}
+	before := e.Snapshot().Cycle
+	_, err = e.Submit(arbiter.Command{Source: "ui", Sequence: 2, Op: arbiter.OpCancel, CancelSeq: 99})
+	mt.CheckReason("wrong cancel seq", "cancel#99 active#1", err, classify.ReasonInvalidCommand)
+	e.Step()
+	mt.CheckTrue("still progressing", "after bad cancel",
+		e.Snapshot().Cycle == before+1 && e.State() == engine.StateRunning,
+		"active command must keep running")
+	r := e.Run()
+	mt.CheckTrue("original completes", "ui#1", r.Done, "wrong cancel must not stop it")
+}

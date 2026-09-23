@@ -360,14 +360,16 @@ func (e *Engine) stepLocked() Result {
 		applyZero()
 		return Result{State: e.state}
 	case StateFault:
-		// Safe stop: deterministic velocity-damping brake computed directly
-		// from valid feedback (no PID / no reliance on the old command). With
-		// feedback lost the only safe output is zero torque. The commanded
-		// position shown in snapshots is FROZEN at the last trajectory point
-		// so the deviation caused by the fault stays visible.
+		// Safe stop: read current velocity, compute a deterministic damping
+		// brake from it, then apply it this same cycle. With feedback lost the
+		// only safe output is zero torque. Command position is frozen at the
+		// last trajectory point so the fault-induced deviation stays visible.
 		frozen := e.frozenCommandLocked(n)
-		fb := e.plant.Step(e.brakeTorqueLocked(), e.disturbance)
-		e.publishLocked(frozen, e.brakeTorqueLocked(), make([]bool, n), fb)
+		fb := e.plant.Read()
+		tau := e.brakeTorqueFromReadingLocked(fb)
+		e.plant.Apply(tau, e.disturbance)
+		fb = e.plant.Read() // post-apply measurement for a consistent snapshot
+		e.publishLocked(frozen, tau, make([]bool, n), fb)
 		e.cycle++
 		return Result{State: StateFault, ID: e.safeActiveID(), Fault: e.fault}
 	}
@@ -381,15 +383,19 @@ func (e *Engine) stepLocked() Result {
 	}
 
 	cmd := e.active.traj.Points[e.active.idx]
-	fb := e.plant.Step(e.torque, e.disturbance)
+	fb := e.plant.Read()
 	tau, sat, f := e.controller.Step(cmd, fb)
-	e.torque = tau
-	e.publishLocked(cmd, tau, sat, fb)
-	e.cycle++
-
 	if f != nil {
+		// A fault this cycle: do not actuate the computed torque, power off.
+		e.plant.Apply(make([]float64, n), e.disturbance)
+		e.publishLocked(cmd, make([]float64, n), make([]bool, n), e.plant.Read())
+		e.cycle++
 		return e.latchFaultLocked(f)
 	}
+	e.plant.Apply(tau, e.disturbance)
+	e.torque = tau
+	e.publishLocked(cmd, tau, sat, e.plant.Read())
+	e.cycle++
 
 	last := len(e.active.traj.Points) - 1
 	if e.active.idx >= last {
@@ -468,8 +474,7 @@ func (e *Engine) stepStoppingLocked() Result {
 			cmd.Position[i] = e.lastAxes[i].PositionCommand
 		}
 	}
-	fb := e.plant.Step(e.torque, e.disturbance)
-	// Without a ramp we do not close the loop: zero torque is the safe output.
+	fb := e.plant.Read()
 	var tau []float64
 	var sat []bool
 	var f *controller.Fault
@@ -479,12 +484,17 @@ func (e *Engine) stepStoppingLocked() Result {
 		tau = make([]float64, n)
 		sat = make([]bool, n)
 	}
-	e.torque = tau
-	e.publishLocked(cmd, tau, sat, fb)
-	e.cycle++
 	if f != nil {
+		e.plant.Apply(make([]float64, n), e.disturbance)
+		e.publishLocked(cmd, make([]float64, n), make([]bool, n), e.plant.Read())
+		e.cycle++
 		return e.latchFaultLocked(f)
 	}
+	e.plant.Apply(tau, e.disturbance)
+	e.torque = tau
+	fb = e.plant.Read()
+	e.publishLocked(cmd, tau, sat, fb)
+	e.cycle++
 
 	finished := false
 	if ramp != nil && ramp.traj != nil {
@@ -599,6 +609,26 @@ func (e *Engine) frozenCommandLocked(n int) trajectory.Point {
 		copy(pt.Position, e.plant.Position())
 	}
 	return pt
+}
+
+// brakeTorqueFromReadingLocked computes the damping brake from a specific
+// reading (zero torque when the reading is invalid).
+func (e *Engine) brakeTorqueFromReadingLocked(fb plant.EncoderReading) []float64 {
+	n := e.cfg.AxisCount()
+	tau := make([]float64, n)
+	if !fb.Valid {
+		return tau
+	}
+	for i, a := range e.cfg.Axes {
+		b := -brakeGain * fb.Velocity[i]
+		if b > a.MaxTorque {
+			b = a.MaxTorque
+		} else if b < -a.MaxTorque {
+			b = -a.MaxTorque
+		}
+		tau[i] = b
+	}
+	return tau
 }
 
 // brakeTorqueLocked returns a per-axis damping torque opposing velocity,
@@ -842,8 +872,11 @@ const settleStreakCycles = 20
 
 func settlePosTolFor(tol float64) float64 { return tol * 0.1 }
 func settleVelTolFor(period float64) float64 {
-	// tiny absolute speed threshold (rad/s)
-	return 1e-4
+	// Near-zero speed for "at target": tight enough that residual motion over
+	// one cycle is far below the position tolerance, but above the discrete
+	// integral-action tail. (At 5e-4 rad/s the per-cycle displacement is
+	// period*5e-4, orders of magnitude below the 0.1*tolerance position test.)
+	return 5e-4
 }
 
 const settleBudgetSeconds = 5.0

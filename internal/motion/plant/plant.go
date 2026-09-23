@@ -56,10 +56,24 @@ func (s *Sim) Reset(position, velocity []float64) {
 	s.feedbackOK = true
 }
 
-// Step integrates one fixed control cycle. torque is the actuator torque
-// (N*m), disturbance an optional additive deterministic torque (N*m, nil
-// means zero). It returns the encoder reading taken after the update.
-func (s *Sim) Step(torque, disturbance []float64) EncoderReading {
+// Read returns the current encoder reading WITHOUT changing state. It is
+// used to implement the correct zero-order-hold order read -> compute torque
+// -> Apply.
+func (s *Sim) Read() EncoderReading {
+	if !s.feedbackOK {
+		return EncoderReading{Valid: false}
+	}
+	return EncoderReading{
+		Valid:    true,
+		Position: append([]float64(nil), s.position...),
+		Velocity: append([]float64(nil), s.velocity...),
+	}
+}
+
+// Apply integrates one fixed control cycle under the torque (N*m) computed
+// for THIS cycle, plus an optional deterministic disturbance (N*m, nil is
+// zero). Semi-implicit Euler (velocity then position), deterministic.
+func (s *Sim) Apply(torque, disturbance []float64) {
 	d := make([]float64, s.n)
 	if disturbance != nil {
 		copy(d, disturbance)
@@ -74,19 +88,17 @@ func (s *Sim) Step(torque, disturbance []float64) EncoderReading {
 		}
 		net := tau + s.gravity[i] + dist
 		acc := net / s.inertia[i]
-		// Semi-implicit Euler: velocity first, then position. Deterministic
-		// and stable for the stiff PID case at fixed dt.
 		s.velocity[i] += acc * s.period
 		s.position[i] += s.velocity[i] * s.period
 	}
-	if !s.feedbackOK {
-		return EncoderReading{Valid: false}
-	}
-	return EncoderReading{
-		Valid:    true,
-		Position: append([]float64(nil), s.position...),
-		Velocity: append([]float64(nil), s.velocity...),
-	}
+}
+
+// Step is retained for simple callers/tests: it applies the given torque for
+// one cycle and returns the reading taken AFTER the update (one-cycle delay
+// semantics). Closed-loop control should use Read + Apply instead.
+func (s *Sim) Step(torque, disturbance []float64) EncoderReading {
+	s.Apply(torque, disturbance)
+	return s.Read()
 }
 
 // SetFeedbackValid simulates encoder connection (true) / loss (false).
