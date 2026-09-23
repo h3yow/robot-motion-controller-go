@@ -2,6 +2,8 @@
 // rejection reasons and fault kinds used across the motion controller.
 package classify
 
+import "errors"
+
 // Reason is a stable, machine-readable code identifying why an input was
 // rejected or why a command did not take effect.
 type Reason string
@@ -30,24 +32,25 @@ const (
 	// ReasonAccelerationLimit is returned when requested motion exceeds an
 	// acceleration limit.
 	ReasonAccelerationLimit Reason = "ACCELERATION_LIMIT_EXCEEDED"
-	// ReasonTorqueLimit is returned when requested torque exceeds a torque
-	// limit.
+	// ReasonTorqueLimit is returned when a trajectory/request cannot be
+	// tracked within the torque limit.
 	ReasonTorqueLimit Reason = "TORQUE_LIMIT_EXCEEDED"
 	// ReasonContradictoryTarget is returned when a request is
-	// self-contradictory (e.g. zero duration with nonzero displacement).
+	// self-contradictory (e.g. zero duration with nonzero displacement,
+	// mismatched vector lengths).
 	ReasonContradictoryTarget Reason = "CONTRADICTORY_TARGET"
 	// ReasonStaleCommand is returned when a command's sequence number is
 	// older than a previously observed command from the same source.
 	ReasonStaleCommand Reason = "STALE_COMMAND"
 	// ReasonDuplicateCommand is returned when exactly the same
-	// (source, sequence) command is submitted again after completion.
+	// (source, sequence) command is submitted after it was already seen.
 	ReasonDuplicateCommand Reason = "DUPLICATE_COMMAND"
 	// ReasonCancelled is returned when a motion was aborted by a cancel.
 	ReasonCancelled Reason = "CANCELLED"
 	// ReasonFaultActive is returned when a command cannot be accepted
 	// because a fault state is currently active.
 	ReasonFaultActive Reason = "FAULT_ACTIVE"
-	// ReasonResetNotSatisfied is returned when a reset/clear is requested
+	// ReasonResetNotSatisfied is returned when a reset/recovery is requested
 	// while recovery preconditions are not met.
 	ReasonResetNotSatisfied Reason = "RESET_PRECONDITIONS_NOT_MET"
 	// ReasonInvalidCommand is returned for malformed command envelopes.
@@ -74,15 +77,15 @@ func New(reason Reason, msg string) *RejectError {
 	return &RejectError{Reason: reason, Msg: msg}
 }
 
-// AsReject reports whether err carries a RejectError and returns it.
+// AsReject reports whether err carries a RejectError (directly or wrapped)
+// and returns it.
 func AsReject(err error) (*RejectError, bool) {
 	if err == nil {
 		return nil, false
 	}
 	var r *RejectError
-	if e, ok := err.(*RejectError); ok {
-		return e, true
+	if errors.As(err, &r) {
+		return r, true
 	}
-	_ = r
 	return nil, false
 }
