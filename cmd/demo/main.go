@@ -8,7 +8,6 @@ package main
 import (
 	"fmt"
 	"math"
-	"sync"
 
 	"github.com/h3yow/robot-motion-controller-go/internal/motion"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/arbiter"
@@ -102,49 +101,29 @@ func main() {
 	cr := e.Run()
 	fmt.Printf("   cancel result: state=%s done=%v (a cancel never reports Done)\n", cr.State, cr.Done)
 
-	section("5. Concurrent entry points: duplicate/late commands arbitrated")
-	_, _ = e.Submit(move("seed", 1, 1, 0.5, 0.5))
-	var wg sync.WaitGroup
-	results := make(chan classify.Reason, 16)
-	for g := 0; g < 4; g++ {
-		wg.Add(1)
-		go func(g int) {
-			defer wg.Done()
-			for k := 0; k < 4; k++ { // intentionally identical seq across goroutines
-				_, err := e.Submit(move("race", int64(k), 5, 0, 0))
-				if rj, ok := classify.AsReject(err); ok {
-					results <- rj.Reason
-				} else {
-					results <- classify.ReasonOK
-				}
-			}
-		}(g)
-	}
-	done := make(chan struct{})
-	var swg sync.WaitGroup
-	swg.Add(1)
-	go func() {
-		defer swg.Done()
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				e.Step()
-			}
+	section("5. Multiple entry points: duplicate/late/out-of-order arbitration")
+	// This scenario is intentionally serialized (deterministic interleaving of
+	// distinct entry points) so the printed classification is reproducible
+	// bit-for-bit. Genuine parallel hammering with data-race safety is covered
+	// deterministically by `go test -race`.
+	_, _ = e.Submit(move("seed", 1, 1, 0.5, 0.5)) // active, prio 1
+	probe := func(label string, c arbiter.Command) {
+		_, err := e.Submit(c)
+		if rj, ok := classify.AsReject(err); ok {
+			fmt.Printf("   %-30s -> %s\n", label, rj.Reason)
+		} else {
+			fmt.Printf("   %-30s -> ACCEPTED\n", label)
 		}
-	}()
-	wg.Wait()
-	close(done)
-	swg.Wait()
-	close(results)
-	tally := map[classify.Reason]int{}
-	for rsn := range results {
-		tally[rsn]++
 	}
-	fmt.Printf("   identical concurrent submissions classified: accepted=%d duplicate=%d priority=%d stale=%d\n",
-		tally[classify.ReasonOK], tally[classify.ReasonDuplicateCommand],
-		tally[classify.ReasonPriorityDenied], tally[classify.ReasonStaleCommand])
+	probe("low prio while active (s#1)", move("s", 1, 0, -0.5, 0))
+	probe("high prio preempt (h#1)", move("h", 1, 9, 0, 0)) // preempts seed
+	probe("replay h#1 (duplicate)", move("h", 1, 9, 0, 0))
+	probe("late h#0 (stale)", move("h", 0, 9, 0.1, 0))
+	probe("low prio while h pending (o#1)", move("o", 1, 0, 0.2, 0))
+	e.Run() // stop seed, then run h to completion -> IDLE
+	probe("replay h#1 after done", move("h", 1, 9, 0, 0))
+	probe("newer h#2 while idle", move("h", 2, 0, 0.1, 0))
+	e.Run()
 
 	section("done")
 }
