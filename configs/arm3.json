@@ -1,0 +1,57 @@
+{
+  "version": "1.0.0",
+  "period": "2ms",
+  "links": [0.4, 0.3, 0.1],
+  "elbow": "up",
+  "axes": [
+    {
+      "name": "joint1",
+      "home": 0.0,
+      "min": -3.14159,
+      "max": 3.14159,
+      "max_velocity": 3.0,
+      "max_accel": 8.0,
+      "max_torque": 25.0,
+      "inertia": 1.0,
+      "gravity_torque": 0.0,
+      "friction_torque": 0.2,
+      "gains": { "kp": 40.0, "ki": 8.0, "kd": 10.0, "integral_limit": 8.0 }
+    },
+    {
+      "name": "joint2",
+      "home": 0.0,
+      "min": -2.5,
+      "max": 2.5,
+      "max_velocity": 3.0,
+      "max_accel": 8.0,
+      "max_torque": 25.0,
+      "inertia": 1.0,
+      "gravity_torque": 0.0,
+      "friction_torque": 0.2,
+      "gains": { "kp": 40.0, "ki": 8.0, "kd": 10.0, "integral_limit": 8.0 }
+    },
+    {
+      "name": "joint3",
+      "home": 0.0,
+      "min": -3.14159,
+      "max": 3.14159,
+      "max_velocity": 4.0,
+      "max_accel": 10.0,
+      "max_torque": 20.0,
+      "inertia": 0.6,
+      "gravity_torque": 0.0,
+      "friction_torque": 0.2,
+      "gains": { "kp": 30.0, "ki": 6.0, "kd": 8.0, "integral_limit": 6.0 }
+    }
+  ],
+  "tolerance": { "position": 0.005, "velocity": 0.02, "hold_ticks": 3 },
+  "fault": {
+    "max_position_error": 0.2,
+    "diverge_error": 0.6,
+    "dropout_max_ticks": 2,
+    "saturation_max_ticks": 15,
+    "end_grace_ticks": 60,
+    "recovery_hold_ticks": 2,
+    "safe_decel": 12.0
+  }
+}
