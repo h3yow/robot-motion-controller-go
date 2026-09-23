@@ -55,6 +55,9 @@ const (
 	ReasonResetNotSatisfied Reason = "RESET_PRECONDITIONS_NOT_MET"
 	// ReasonInvalidCommand is returned for malformed command envelopes.
 	ReasonInvalidCommand Reason = "INVALID_COMMAND"
+	// ReasonPriorityDenied is returned when a command cannot preempt the
+	// incumbent because its priority is not strictly higher.
+	ReasonPriorityDenied Reason = "PRIORITY_DENIED"
 )
 
 // RejectError is the single structured error type for input/command
