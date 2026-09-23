@@ -321,3 +321,42 @@ func TestCancelWrongTargetKeepsRunning(t *testing.T) {
 	r := e.Run()
 	mt.CheckTrue("original completes", "ui#1", r.Done, "wrong cancel must not stop it")
 }
+
+// TestSaturationFaultEndToEnd drives a load the actuator cannot hold within
+// its torque cap, producing persistent saturation -> recoverable fault.
+func TestSaturationFaultEndToEnd(t *testing.T) {
+	mt := mctest.Wrap(t)
+	c := testCfg()
+	// Planner is feasible exactly at the cap (inertia 2 * accel 1 = 2 N*m);
+	// during acceleration the feed-forward already sits at the cap, so even
+	// ordinary tracking-error correction pushes the commanded torque over it
+	// for consecutive cycles -> persistent saturation fault. With no external
+	// load the post-fault damping brake can then bring the axis to rest.
+	c.Axes[0].Inertia = 2
+	c.Axes[0].MaxTorque = 2
+	c.Axes[0].MaxAccel = 1
+	c.Controller.SaturationCycles = 5
+	e := engine.New(c)
+	_, err := e.Submit(move("ui", 1, 0, 0.05, 0))
+	mt.CheckNoErr("submit", "feed-forward at torque cap", err)
+	var f *controller.Fault
+	for k := 0; k < 500 && f == nil; k++ {
+		e.Step()
+		f = e.Snapshot().Fault
+	}
+	mt.CheckTrue("saturation fault", "MaxTorque=1", f != nil && f.Kind == controller.FaultDriveSaturated,
+		"expected persistent saturation fault")
+	mt.CheckTrue("recoverable", "saturation", f.Kind.Recoverable(), "saturation must be recoverable")
+	// Before the axes settle, recovery is refused; once stopped it succeeds.
+	if err := e.Recover(); err == nil {
+		t.Fatalf("recovery must be refused while axes are still moving/faulted")
+	}
+	for k := 0; k < 2000 && e.State() == engine.StateFault; k++ {
+		e.Step()
+		if stopped(e.Snapshot()) {
+			break
+		}
+	}
+	mt.CheckNoErr("recover after stop", "saturation", e.Recover())
+	mt.CheckEq("idle", "post saturation recover", e.State(), engine.StateIdle)
+}
