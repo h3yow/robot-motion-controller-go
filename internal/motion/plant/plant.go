@@ -65,7 +65,14 @@ func (s *Sim) Step(torque, disturbance []float64) EncoderReading {
 		copy(d, disturbance)
 	}
 	for i := 0; i < s.n; i++ {
-		net := torque[i] + s.gravity[i] + d[i]
+		var tau, dist float64
+		if i < len(torque) {
+			tau = torque[i]
+		}
+		if i < len(d) {
+			dist = d[i]
+		}
+		net := tau + s.gravity[i] + dist
 		acc := net / s.inertia[i]
 		// Semi-implicit Euler: velocity first, then position. Deterministic
 		// and stable for the stiff PID case at fixed dt.
