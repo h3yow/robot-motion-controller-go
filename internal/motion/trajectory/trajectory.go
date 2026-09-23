@@ -176,7 +176,7 @@ func (pr axisProfile) sample(t, Tn float64) (pos, vel, acc float64) {
 		vel = a * (Tn - t)
 		acc = -a
 	}
-	return pr.start + sign*pos, sign*vel, sign*acc
+	return pr.start + sign*pos, sign * vel, sign * acc
 }
 
 // segment builds the synchronized samples for one start->goal move.

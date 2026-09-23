@@ -10,12 +10,12 @@ import (
 	"math"
 	"sync"
 
+	"github.com/h3yow/robot-motion-controller-go/internal/motion"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/arbiter"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/classify"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/config"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/engine"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/kinematics"
-	"github.com/h3yow/robot-motion-controller-go/internal/motion"
 )
 
 func main() {
@@ -62,7 +62,8 @@ func main() {
 			panic("expected a fault but motion completed")
 		}
 	}
-	fmt.Print("   recover while feedback lost -> "); printReason(e.Recover())
+	fmt.Print("   recover while feedback lost -> ")
+	printReason(e.Recover())
 	e.SetFeedbackValid(true)
 	for k := 0; k < 1000 && e.State() == engine.StateFault; k++ {
 		e.Step()

@@ -4,12 +4,12 @@ import (
 	"math"
 	"testing"
 
+	"github.com/h3yow/robot-motion-controller-go/internal/motion"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/classify"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/config"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/engine"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/kinematics"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion/mctest"
-	"github.com/h3yow/robot-motion-controller-go/internal/motion"
 )
 
 func cfg() *config.Config {

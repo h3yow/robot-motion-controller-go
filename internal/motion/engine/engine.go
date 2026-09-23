@@ -75,9 +75,9 @@ type activeMotion struct {
 	traj     *trajectory.Trajectory
 	idx      int
 	// terminal hold (settle) bookkeeping
-	holding       bool
-	settleStreak  int
-	holdCycles    int
+	holding      bool
+	settleStreak int
+	holdCycles   int
 }
 
 // stopRamp decelerates the axes to rest after a cancel/preempt/fault.
@@ -106,8 +106,8 @@ type Engine struct {
 	controller *controller.Controller
 	arb        *arbiter.Arbiter
 
-	state    State
-	cycle    int64
+	state       State
+	cycle       int64
 	active      *activeMotion
 	stopping    *stopRamp
 	pending     *pendingMotion

@@ -55,9 +55,9 @@ func (k FaultKind) Recoverable() bool {
 
 // Fault describes a detected fault with the evidence that triggered it.
 type Fault struct {
-	Kind    FaultKind
-	Axis    int
-	Message string
+	Kind     FaultKind
+	Axis     int
+	Message  string
 	Evidence map[string]float64
 }
 

@@ -70,12 +70,12 @@ func TestPlanningRejections(t *testing.T) {
 	mt := mctest.Wrap(t)
 	cfg := testCfg()
 	cases := []struct {
-		name     string
-		start    []float64
-		goal     []float64
-		vel      []float64
-		accel    []float64
-		reason   classify.Reason
+		name   string
+		start  []float64
+		goal   []float64
+		vel    []float64
+		accel  []float64
+		reason classify.Reason
 	}{
 		{"nonfinite goal", []float64{0, 0}, []float64{1, nan()}, []float64{2, 1.5}, []float64{4, 3}, classify.ReasonTargetNonFinite},
 		{"out of travel", []float64{0, 0}, []float64{4, 0}, []float64{2, 1.5}, []float64{4, 3}, classify.ReasonOutOfTravel},
@@ -98,7 +98,17 @@ func TestPlanningRejections(t *testing.T) {
 	}
 }
 
-func abs(x float64) float64 { if x < 0 { return -x }; return x }
-func maxf(a, b float64) float64 { if a > b { return a }; return b }
-func nan() float64 { return float64NaN() }
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+func maxf(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+func nan() float64          { return float64NaN() }
 func ftoa(x float64) string { return fmtSprint(x) }

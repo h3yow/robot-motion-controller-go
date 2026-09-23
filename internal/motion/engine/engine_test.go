@@ -240,8 +240,8 @@ func TestConcurrentSubmits(t *testing.T) {
 			}
 		}
 	}()
-	wg.Wait()       // submitters finish
-	close(stop)     // then stop steppers/readers
+	wg.Wait()   // submitters finish
+	close(stop) // then stop steppers/readers
 	swg.Wait()
 	s := e.Snapshot()
 	for ax, a := range s.Axes {

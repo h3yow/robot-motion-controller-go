@@ -119,4 +119,9 @@ func TestNonFiniteFault(t *testing.T) {
 	mt.CheckTrue("unrecoverable", "nonfinite", !f.Kind.Recoverable(), "non-finite must be unrecoverable")
 }
 
-func abs(x float64) float64 { if x < 0 { return -x }; return x }
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
