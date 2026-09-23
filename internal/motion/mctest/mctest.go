@@ -35,7 +35,7 @@ func (t T) CheckEq(name string, input, got, want any) {
 func (t T) CheckTrue(name string, input any, ok bool, basis string) {
 	t.Helper()
 	if !ok {
-		t.fail(name, input, basis)
+		t.fail(name, input, "%s", basis)
 	}
 }
 
