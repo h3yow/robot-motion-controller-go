@@ -17,6 +17,7 @@ import (
 
 	"github.com/h3yow/robot-motion-controller-go/internal/arbiter"
 	"github.com/h3yow/robot-motion-controller-go/internal/config"
+	"github.com/h3yow/robot-motion-controller-go/internal/control"
 	"github.com/h3yow/robot-motion-controller-go/internal/kinematics"
 	"github.com/h3yow/robot-motion-controller-go/internal/mcerr"
 	"github.com/h3yow/robot-motion-controller-go/internal/motion"
@@ -77,6 +78,116 @@ func main() {
 		log.Fatalf("replay differs: %v vs %v", final1, f2)
 	}
 	fmt.Printf("   replay matches: %+.4f\n", f2)
+
+	fmt.Println("== 6. waypoint path, append, pause/resume, queue status ==")
+	demoPathQueue(cfg)
+}
+
+// demoPathQueue exercises the new ordered-waypoint path, mid-run append,
+// pause/resume, the pending-command ceiling and the consistent queue query.
+func demoPathQueue(cfg *config.Config) {
+	ctx := context.Background()
+	s := mustService(cfg, nil)
+	defer s.Close()
+
+	id, err := s.MovePath(ctx, "hmi", 1, arbiter.PriorityNormal, []motion.Waypoint{
+		{Joints: []float64{0.5, 0, 0}},
+		{Pose: &kinematics.Pose{X: 0.55, Y: 0.2, Phi: 0.3}},
+	})
+	if err != nil {
+		log.Fatalf("MovePath: %v", err)
+	}
+	// Append a joint waypoint while the first segment is in flight.
+	s.Step(40)
+	if err := s.AppendWaypoints(ctx, id, []motion.Waypoint{
+		{Joints: []float64{-0.2, 0.2, -0.2}},
+	}); err != nil {
+		log.Fatalf("append: %v", err)
+	}
+
+	// Pause: axes brake to rest then hold in place with the loop active.
+	if err := s.Pause(ctx, id); err != nil {
+		log.Fatalf("pause: %v", err)
+	}
+	stepUntilSettled(s, control.PhasePaused, 30, 20000)
+	st, _ := s.Queue(ctx)
+	fmt.Printf("   paused: phase=%s active=#%d waypoint=%d/%d pending=%d/%d\n",
+		st.Phase, st.ActiveID, st.Active.WaypointIndex, st.Active.WaypointTotal,
+		st.Pending, st.MaxPending)
+	held := s.Axes()[0].Position
+	for k := 0; k < 200; k++ {
+		s.Step(1)
+	}
+	if d := s.Axes()[0].Position - held; d > 0.005 || d < -0.005 {
+		log.Fatalf("axis drifted %.5f rad while paused", d)
+	}
+	if err := s.Resume(ctx, id); err != nil {
+		log.Fatalf("resume: %v", err)
+	}
+	oc := wait(s, id)
+	fmt.Printf("   path outcome: %s, final joints %+.4f\n", oc.State, roundAxes(s.Axes()))
+
+	// Pending ceiling: submit a burst of multi-point paths and show the
+	// distinct queue_full rejection once the budget is exceeded.
+	full := false
+	for k := 0; k < 1000; k++ {
+		_, e := s.MovePath(ctx, fmt.Sprintf("bulk%d", k), 1, arbiter.PriorityLow,
+			[]motion.Waypoint{{Joints: []float64{0.1, 0, 0}}})
+		if e != nil {
+			if code(e) != mcerr.CodeQueueFull {
+				log.Fatalf("unexpected submit error: %v", e)
+			}
+			full = true
+			break
+		}
+	}
+	if !full {
+		log.Fatal("expected queue_full under a bounded backlog")
+	}
+	st, _ = s.Queue(ctx)
+	fmt.Printf("   backlog capped: pending=%d/%d, over-capacity submit -> code=%s\n",
+		st.Pending, st.MaxPending, mcerr.CodeQueueFull)
+}
+
+// stepUntilSettled steps until the controller reports want and every axis
+// has stayed within the convergence velocity band for run consecutive
+// cycles (covering the small post-brake rebound into the held position).
+func stepUntilSettled(s *motion.Service, want control.Phase, run, max int) {
+	parked := false
+	rest := 0
+	for k := 0; k < max; k++ {
+		s.Step(1)
+		st, err := s.Queue(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+		if st.Phase == want {
+			parked = true
+		}
+		atRest := true
+		for _, a := range s.Axes() {
+			if a.Velocity > 0.02 || a.Velocity < -0.02 {
+				atRest = false
+			}
+		}
+		if parked && atRest {
+			rest++
+		} else {
+			rest = 0
+		}
+		if rest >= run {
+			return
+		}
+	}
+	log.Fatalf("never settled in phase %s", want)
+}
+
+func roundAxes(axes []control.AxisStatus) []float64 {
+	out := make([]float64, len(axes))
+	for i, a := range axes {
+		out[i] = a.Position
+	}
+	return out
 }
 
 func run(cfg *config.Config, drop motion.DropFn) []float64 {
@@ -141,8 +252,9 @@ func driveToFault(s *motion.Service, id uint64) {
 func code(err error) mcerr.Code { return mcerr.CodeOf(err) }
 
 func demoConfig() *config.Config {
+	maxPending := 64
 	return &config.Config{
-		Version: "1.0.0", Period: 2_000_000,
+		Version: "1.1.0", Period: 2_000_000, MaxPendingCommands: &maxPending,
 		Links: []float64{0.4, 0.3, 0.1}, Elbow: "up",
 		Axes: []config.AxisConfig{
 			{Name: "j1", HomePosition: 0, MinPosition: -3, MaxPosition: 3,

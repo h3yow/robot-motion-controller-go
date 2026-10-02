@@ -37,6 +37,14 @@ const (
 	CodeDuplicateCmd   Code = "duplicate_command"
 	CodePriorityTooLow Code = "priority_too_low"
 	CodeCommandUnknown Code = "command_unknown"
+
+	// CodeQueueFull rejects a new command/path/waypoint when admitting it
+	// would exceed the configured max pending command budget.
+	CodeQueueFull Code = "queue_full"
+	// CodeOperationInvalid rejects an operation whose target is not in a
+	// state where that operation applies (e.g. pause a queued command,
+	// append to an already finished path).
+	CodeOperationInvalid Code = "operation_invalid"
 )
 
 // Error is the classified error type used across all packages.

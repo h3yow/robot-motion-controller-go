@@ -350,3 +350,17 @@ func (a *Arbiter) QueuedIDs() []uint64 {
 	})
 	return ids
 }
+
+// Command returns a copy of the stored command for id, or false when the
+// id is unknown.
+func (a *Arbiter) Command(id uint64) (Command, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.entries[id]
+	if !ok {
+		return Command{}, false
+	}
+	cmd := e.cmd
+	cmd.Goal = append([]float64(nil), e.cmd.Goal...)
+	return cmd, true
+}

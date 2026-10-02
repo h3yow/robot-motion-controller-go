@@ -19,12 +19,20 @@ import (
 
 // Versioning constants. Major version differences are incompatible.
 const (
-	CurrentVersion = "1.0.0"
+	// CurrentVersion is 1.1.0: adds the optional max_pending_commands
+	// field. 1.0.x documents remain accepted (same major, additive field);
+	// when that field is absent, DefaultMaxPendingCommands is used.
+	CurrentVersion = "1.1.0"
 	MinMajor       = 1
 	MaxMajor       = 1
 
 	// SupportedDOF is the only supported planar arm joint count.
 	SupportedDOF = 3
+
+	// DefaultMaxPendingCommands is the documented, fixed budget applied
+	// when a 1.0 configuration does not specify max_pending_commands. It
+	// is never silently lowered.
+	DefaultMaxPendingCommands = 256
 )
 
 // PIDGains are per-axis joint-space PID gains.
@@ -104,17 +112,24 @@ type Config struct {
 	Axes      []AxisConfig `json:"axes"`
 	Tolerance Tolerance    `json:"tolerance"`
 	Fault     FaultPolicy  `json:"fault"`
+
+	// MaxPendingCommands bounds the number of admitted-but-not-finished
+	// motion items (queued commands plus unexecuted path waypoints). A nil
+	// pointer means the field was absent (valid only for a 1.0 document),
+	// in which case DefaultMaxPendingCommands applies.
+	MaxPendingCommands *int `json:"max_pending_commands"`
 }
 
 // rawConfig avoids reflection coupling around the period wrapper.
 type rawConfig struct {
-	Version   string       `json:"version"`
-	Period    duration     `json:"period"`
-	Links     []float64    `json:"links"`
-	Elbow     string       `json:"elbow"`
-	Axes      []AxisConfig `json:"axes"`
-	Tolerance Tolerance    `json:"tolerance"`
-	Fault     FaultPolicy  `json:"fault"`
+	Version            string       `json:"version"`
+	Period             duration     `json:"period"`
+	Links              []float64    `json:"links"`
+	Elbow              string       `json:"elbow"`
+	Axes               []AxisConfig `json:"axes"`
+	Tolerance          Tolerance    `json:"tolerance"`
+	Fault              FaultPolicy  `json:"fault"`
+	MaxPendingCommands *int         `json:"max_pending_commands"`
 }
 
 // Parse reads and validates a JSON configuration stream. Unknown fields are
@@ -134,14 +149,15 @@ func Parse(r io.Reader) (*Config, error) {
 		return nil, mcerr.New(mcerr.CodeConfigInvalid, "configuration must contain exactly one JSON object")
 	}
 	cfg := &Config{
-		Version:   raw.Version,
-		Period:    time.Duration(raw.Period),
-		periodRaw: raw.Period,
-		Links:     raw.Links,
-		Elbow:     raw.Elbow,
-		Axes:      raw.Axes,
-		Tolerance: raw.Tolerance,
-		Fault:     raw.Fault,
+		Version:            raw.Version,
+		Period:             time.Duration(raw.Period),
+		periodRaw:          raw.Period,
+		Links:              raw.Links,
+		Elbow:              raw.Elbow,
+		Axes:               raw.Axes,
+		Tolerance:          raw.Tolerance,
+		Fault:              raw.Fault,
+		MaxPendingCommands: raw.MaxPendingCommands,
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -161,7 +177,7 @@ func Load(path string) (*Config, error) {
 
 // Validate checks all compatibility and physical constraints.
 func (c *Config) Validate() error {
-	major, _, _, err := parseVersion(c.Version)
+	major, minor, _, err := parseVersion(c.Version)
 	if err != nil {
 		return mcerr.Wrap(mcerr.CodeConfigInvalid, "invalid version", err)
 	}
@@ -169,6 +185,18 @@ func (c *Config) Validate() error {
 		return mcerr.New(mcerr.CodeConfigVersionUnsupported,
 			fmt.Sprintf("configuration version %q is outside the compatible range %d.x (current %s)",
 				c.Version, MaxMajor, CurrentVersion))
+	}
+	if c.MaxPendingCommands != nil {
+		if *c.MaxPendingCommands <= 0 {
+			return mcerr.New(mcerr.CodeConfigInvalid,
+				fmt.Sprintf("max_pending_commands must be strictly positive, got %d", *c.MaxPendingCommands))
+		}
+	} else if minor >= 1 {
+		// 1.1+ documents opt into the explicit budget; refusing a missing
+		// field avoids a silently assumed capacity.
+		return mcerr.New(mcerr.CodeConfigInvalid,
+			"max_pending_commands is required for configuration versions >= 1.1.0 "+
+				"(1.0 documents keep using the documented default when absent)")
 	}
 	if c.Period <= 0 {
 		return mcerr.New(mcerr.CodeConfigInvalid, "period must be set and strictly positive")
@@ -279,16 +307,27 @@ func parseVersion(v string) (major, minor, patch int, err error) {
 	return out[0], out[1], out[2], nil
 }
 
+// EffectiveMaxPending returns the pending-command budget in force: the
+// explicitly configured value, or DefaultMaxPendingCommands for a legacy
+// 1.0 document that omits the field.
+func (c *Config) EffectiveMaxPending() int {
+	if c.MaxPendingCommands != nil {
+		return *c.MaxPendingCommands
+	}
+	return DefaultMaxPendingCommands
+}
+
 // MarshalJSON is provided so a validated Config can be re-serialized for
 // inspection (the period uses the standard duration string form).
 func (c *Config) MarshalJSON() ([]byte, error) {
 	return json.Marshal(rawConfig{
-		Version:   c.Version,
-		Period:    c.periodRaw,
-		Links:     c.Links,
-		Elbow:     c.Elbow,
-		Axes:      c.Axes,
-		Tolerance: c.Tolerance,
-		Fault:     c.Fault,
+		Version:            c.Version,
+		Period:             c.periodRaw,
+		Links:              c.Links,
+		Elbow:              c.Elbow,
+		Axes:               c.Axes,
+		Tolerance:          c.Tolerance,
+		Fault:              c.Fault,
+		MaxPendingCommands: c.MaxPendingCommands,
 	})
 }

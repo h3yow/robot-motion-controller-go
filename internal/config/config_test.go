@@ -112,3 +112,54 @@ func TestNoSilentDefaults(t *testing.T) {
 		t.Fatal("empty config accepted; required parameters must be explicit")
 	}
 }
+
+// TestMaxPendingCommandsCompatibility covers the 1.1 additive field:
+// 1.0 documents keep working with the documented default, while 1.1 docs
+// must state the budget explicitly and it must be strictly positive.
+func TestMaxPendingCommandsCompatibility(t *testing.T) {
+	// A 1.0 document without the field stays valid and gets the default.
+	cfg, err := Parse(strings.NewReader(validBase))
+	if err != nil {
+		t.Fatalf("legacy 1.0 config rejected: %v", err)
+	}
+	if cfg.MaxPendingCommands != nil {
+		t.Fatalf("absent field should decode to nil, got %d", *cfg.MaxPendingCommands)
+	}
+	if got := cfg.EffectiveMaxPending(); got != DefaultMaxPendingCommands {
+		t.Fatalf("legacy effective budget=%d want default %d", got, DefaultMaxPendingCommands)
+	}
+
+	// Bump the same document to 1.1 without the field: must be rejected
+	// rather than silently assuming a capacity.
+	noField := with(`"version": "1.0.0"`, `"version": "1.1.0"`)
+	if _, err := Parse(strings.NewReader(noField)); err == nil {
+		t.Fatal("1.1 config without max_pending_commands must be rejected")
+	} else if !mcerr.HasCode(err, mcerr.CodeConfigInvalid) {
+		t.Fatalf("want config_invalid, got %v", err)
+	}
+
+	// 1.1 with an explicit positive field is accepted and honored.
+	explicit := with(`"version": "1.0.0"`,
+		`"version": "1.1.0"`, `"period": "2ms",`, `"period": "2ms",
+  "max_pending_commands": 64,`)
+	c2, err := Parse(strings.NewReader(explicit))
+	if err != nil {
+		t.Fatalf("1.1 explicit field rejected: %v", err)
+	}
+	if c2.MaxPendingCommands == nil || *c2.MaxPendingCommands != 64 || c2.EffectiveMaxPending() != 64 {
+		t.Fatalf("explicit budget not honored: %+v", c2.MaxPendingCommands)
+	}
+
+	// Zero / negative budgets are rejected.
+	for _, val := range []string{"0", "-5"} {
+		bad := with(`"version": "1.0.0"`,
+			`"version": "1.1.0"`, `"period": "2ms",`,
+			`"period": "2ms",
+  "max_pending_commands": `+val+`,`)
+		if _, err := Parse(strings.NewReader(bad)); err == nil {
+			t.Fatalf("max_pending_commands=%s must be rejected", val)
+		} else if !mcerr.HasCode(err, mcerr.CodeConfigInvalid) {
+			t.Fatalf("value %s want config_invalid, got %v", val, err)
+		}
+	}
+}

@@ -42,11 +42,13 @@ import (
 type Phase string
 
 const (
-	PhaseIdle     Phase = "idle"
-	PhaseRunning  Phase = "running"
-	PhaseStopping Phase = "stopping"
-	PhaseFaulted  Phase = "faulted"
-	PhaseDone     Phase = "done"
+	PhaseIdle       Phase = "idle"
+	PhaseRunning    Phase = "running"
+	PhasePaused     Phase = "paused"
+	PhaseStopping   Phase = "stopping"
+	PhaseFaulted    Phase = "faulted"
+	PhaseDone       Phase = "done"
+	PhaseSegmentEnd Phase = "segment_end"
 )
 
 // FaultCode classifies controller faults.
@@ -116,6 +118,11 @@ type Controller struct {
 	endTicks    int // cycles past trajectory end
 	holdTicks   int // convergence hold counter
 	recTicks    int // recovery precondition hold counter
+
+	// path / pause state
+	moreSegments bool // more waypoint segments are queued behind the current one
+	paused       bool // resume into PhasePaused instead of running after recovery
+	stopForPause bool // the active stopping ramp was requested by Pause
 }
 
 // New constructs a controller from validated configuration.
@@ -149,6 +156,9 @@ func (c *Controller) Reset(position []float64) {
 	c.holdTicks = 0
 	c.recTicks = 0
 	c.stopSettled = false
+	c.moreSegments = false
+	c.paused = false
+	c.stopForPause = false
 	for i := 0; i < c.n; i++ {
 		c.states[i] = axisState{q: position[i], targetPos: position[i], feedbackOK: true}
 		c.stopV[i] = 0
@@ -157,7 +167,16 @@ func (c *Controller) Reset(position []float64) {
 }
 
 // Load arms a trajectory starting from the current measured configuration.
+// It is the single-segment form: phase becomes PhaseDone when the move
+// converges. Equivalent to LoadSegment(tr, false).
 func (c *Controller) Load(tr *trajectory.Trajectory) error {
+	return c.LoadSegment(tr, false)
+}
+
+// LoadSegment arms one segment of a possibly multi-segment path. When
+// moreSegments is true the controller settles in PhaseSegmentEnd (instead
+// of PhaseDone) so the service can hand over the next segment seamlessly.
+func (c *Controller) LoadSegment(tr *trajectory.Trajectory, moreSegments bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if tr == nil || tr.Len() == 0 {
@@ -178,6 +197,8 @@ func (c *Controller) Load(tr *trajectory.Trajectory) error {
 	c.holdTicks = 0
 	c.recTicks = 0
 	c.stopSettled = false
+	c.moreSegments = moreSegments
+	c.paused = false
 	for i := range c.states {
 		s := &c.states[i]
 		s.integral = 0
@@ -188,17 +209,120 @@ func (c *Controller) Load(tr *trajectory.Trajectory) error {
 	return nil
 }
 
-// Cancel requests a controlled safe stop of the current move.
+// MarkMoreSegments declares that another segment follows the currently
+// loaded one. It may be called while the segment is running or paused
+// (including from PhaseSegmentEnd as long as no next segment has been
+// loaded yet), which lets a waypoint appended during execution seamlessly
+// extend the path instead of ending the command.
+func (c *Controller) MarkMoreSegments() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.phase {
+	case PhaseRunning, PhasePaused, PhaseSegmentEnd:
+		c.moreSegments = true
+		return nil
+	default:
+		return mcerr.New(mcerr.CodeOperationInvalid,
+			fmt.Sprintf("cannot append a segment while controller is %s", c.phase))
+	}
+}
+
+// HasMoreSegments reports whether the current segment ends in a hand-off.
+func (c *Controller) HasMoreSegments() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.moreSegments
+}
+
+// ClearSegment disarms the current trajectory and returns to idle. It is
+// used only when a next segment cannot be planned, which would otherwise
+// leave the controller parked in PhaseSegmentEnd forever.
+func (c *Controller) ClearSegment() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.traj = nil
+	c.idx = 0
+	c.moreSegments = false
+	c.paused = false
+	c.stopForPause = false
+	c.phase = PhaseIdle
+	c.zeroTorqueLocked()
+}
+
+// Pause brings the axes to a controlled stop (the same safe-deceleration
+// ramp used by Cancel) and then holds them at the actual stop position with
+// the closed loop active. The trajectory reference is not frozen at the
+// in-flight sample: braking first avoids a coasting overshoot that the
+// hold could not pull back against static friction. Once stopped the
+// controller is in PhasePaused and parks in place until Resume. Pausing an
+// already paused controller is idempotent; pausing a queued/stopped/done
+// command is rejected.
+func (c *Controller) Pause() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.phase {
+	case PhasePaused, PhaseStopping:
+		return nil
+	case PhaseRunning:
+		c.stopForPause = true
+		c.beginStopLocked("pause")
+		return nil
+	default:
+		return mcerr.New(mcerr.CodeOperationInvalid,
+			fmt.Sprintf("pause requires a running segment, controller is %s", c.phase))
+	}
+}
+
+// IsPaused reports whether the controller is braking for or holding a
+// pause.
+func (c *Controller) IsPaused() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopForPause || c.phase == PhasePaused
+}
+
+// Resume releases the paused hold and returns the controller to idle so the
+// service can re-plan the remaining segment from the measured (settled)
+// position toward the same waypoint. Re-planning on resume makes the final
+// result independent of pause duration and avoids chasing a stale frozen
+// reference after the braking transient. Resuming a non-paused controller
+// is a no-op.
+func (c *Controller) Resume() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != PhasePaused {
+		return nil
+	}
+	c.phase = PhaseIdle
+	c.paused = false
+	c.traj = nil
+	c.idx = 0
+	c.endTicks = 0
+	c.holdTicks = 0
+	for i := range c.states {
+		c.states[i].integral = 0
+	}
+	c.zeroTorqueLocked()
+	return nil
+}
+
+// Cancel requests a controlled safe stop of the current move. A paused
+// segment (or one braking for a pause) also enters the cancel ramp;
+// cancellation remains effective during a pause.
 func (c *Controller) Cancel() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.phase == PhaseRunning {
+	if c.phase == PhaseRunning || c.phase == PhasePaused ||
+		(c.phase == PhaseStopping && c.stopForPause) {
+		c.stopForPause = false
+		c.paused = false
 		c.beginStopLocked("canceled")
 	}
 }
 
 func (c *Controller) beginStopLocked(_ string) {
 	c.phase = PhaseStopping
+	c.paused = false
 	c.stopSettled = false
 	for i := range c.states {
 		// Ramp starts from measured state (last healthy reading), never
@@ -300,7 +424,55 @@ func (c *Controller) Tick(_ time.Time, measuredPosition, measuredVelocity []floa
 			return c.phase, c.fault
 		}
 		if c.stopSettled {
-			c.phase = PhaseDone
+			if c.stopForPause {
+				// Transition from the braking ramp into an in-place hold at
+				// the measured stop position (the safe-stop reference has
+				// converged there), clearing all tracking accumulators.
+				c.stopForPause = false
+				c.paused = true
+				c.phase = PhasePaused
+				for i := range c.states {
+					s := &c.states[i]
+					s.targetPos = c.stopQ[i]
+					s.targetVel = 0
+					s.integral = 0
+				}
+				c.holdTorqueLocked()
+			} else {
+				c.phase = PhaseDone
+			}
+		}
+		return c.phase, nil
+	}
+
+	// Paused / segment boundary: do not advance the trajectory reference.
+	// The axes are held at the frozen reference by pure P/D torque while
+	// feedback health, divergence and saturation are still monitored, so a
+	// pause keeps the closed loop alive instead of free-wheeling.
+	if c.phase == PhasePaused || c.phase == PhaseSegmentEnd {
+		for i := range c.states {
+			s := &c.states[i]
+			if abs(s.err) > c.cfg.Fault.DivergeError {
+				c.enterFatalLocked(i, FaultTrackingDiverged,
+					fmt.Sprintf("tracking error %.4f rad exceeds divergence threshold %.4f while %s",
+						s.err, c.cfg.Fault.DivergeError, c.phase))
+				return c.phase, c.fault
+			}
+			if abs(s.err) > c.cfg.Fault.MaxPositionError {
+				c.enterRecoverableLocked(i, FaultTracking,
+					fmt.Sprintf("tracking error %.4f rad exceeds threshold %.4f while %s",
+						s.err, c.cfg.Fault.MaxPositionError, c.phase))
+				return c.phase, c.fault
+			}
+		}
+		if c.phase == PhasePaused {
+			c.holdTorqueLocked()
+		} else {
+			c.safeHoldTorqueLocked()
+		}
+		c.checkSaturationLocked()
+		if c.fault != nil {
+			return c.phase, c.fault
 		}
 		return c.phase, nil
 	}
@@ -343,8 +515,16 @@ func (c *Controller) Tick(_ time.Time, measuredPosition, measuredVelocity []floa
 		if allConverged {
 			c.holdTicks++
 			if c.holdTicks >= c.cfg.Tolerance.HoldTicks {
-				c.phase = PhaseDone
-				c.zeroTorqueLocked()
+				if c.moreSegments {
+					// Hand-off: park in segment_end with zero torque for
+					// the single cycle the service needs to load the next
+					// segment; the next cycle is running again immediately.
+					c.phase = PhaseSegmentEnd
+					c.zeroTorqueLocked()
+				} else {
+					c.phase = PhaseDone
+					c.zeroTorqueLocked()
+				}
 				return c.phase, nil
 			}
 		} else {
@@ -471,6 +651,63 @@ func (c *Controller) zeroTorqueLocked() {
 	for i := range c.states {
 		c.states[i].tauCmd = 0
 		c.states[i].saturated = false
+	}
+}
+
+// holdVelocityDeadband is the |speed| below which a paused axis is treated
+// as at rest by the position-hold law so plant static friction, rather than
+// a chattering derivative term, absorbs the residual micro-motion.
+const holdVelocityDeadband = 0.01 // rad/s
+
+// holdErrorDeadband is the position error below which a paused axis is
+// considered on its reference and no static-friction compensation bias is
+// added.
+const holdErrorDeadband = 1e-4
+
+// holdTorqueLocked commands a position-hold torque that parks every healthy
+// axis at its frozen reference. It deliberately uses NO integrating term:
+// while paused an axis can linger just to one side of the reference with
+// near-zero speed, and a time-accumulating I term would wind up in that
+// direction and slowly push the axis away. Instead the law is stiff
+// proportional + derivative damping, plus a bounded static-friction
+// compensation bias in the error direction. The closed loop stays fully
+// active (position is measured and corrected every cycle).
+func (c *Controller) holdTorqueLocked() {
+	for i := 0; i < c.n; i++ {
+		a := &c.cfg.Axes[i]
+		s := &c.states[i]
+		if !s.feedbackOK {
+			s.tauCmd = 0
+			s.saturated = false
+			continue
+		}
+		s.err = s.targetPos - s.q
+		// Velocity dead zone: micro-speed below the band is treated as
+		// rest so the plant's static friction absorbs it without the
+		// derivative term chattering.
+		vMeas := s.v
+		if abs(vMeas) <= holdVelocityDeadband {
+			vMeas = 0
+		}
+		tau := a.Gains.Kp*s.err - a.Gains.Kd*vMeas
+		// Bounded static-friction (and gravity) bias, applied only toward
+		// the reference and only for a meaningful error. It lets the
+		// proportional term overcome stiction without an I windup.
+		if abs(s.err) > holdErrorDeadband {
+			bias := a.GravityTorque + a.FrictionTorque
+			tau += bias * sign(s.err)
+		}
+		s.saturated = false
+		if tau > a.MaxTorque {
+			tau, s.saturated = a.MaxTorque, true
+		} else if tau < -a.MaxTorque {
+			tau, s.saturated = -a.MaxTorque, true
+		}
+		if !numeric.Finite(tau) {
+			c.enterFatalLocked(i, FaultCommandNonFinite, "position hold produced non-finite torque")
+			return
+		}
+		s.tauCmd = tau
 	}
 }
 
@@ -638,9 +875,25 @@ func (c *Controller) Recover() error {
 	// Resume the remaining portion of the move from the current reference.
 	c.fault = nil
 	c.recTicks = 0
-	if c.traj != nil && c.idx < c.traj.Len()-1 {
+	switch {
+	case c.paused || c.stopForPause:
+		// The fault occurred while paused or while braking for a pause:
+		// honor the pause intent and remain parked after recovery.
+		c.stopForPause = false
+		c.paused = true
+		c.phase = PhasePaused
+		for i := range c.states {
+			c.states[i].targetPos = c.states[i].q
+			c.states[i].targetVel = 0
+			c.states[i].integral = 0
+		}
+	case c.traj != nil && c.idx < c.traj.Len()-1:
 		c.phase = PhaseRunning
-	} else {
+	case c.moreSegments:
+		// Fault occurred exactly at the segment boundary: keep the
+		// hand-off pending so the service loads the next segment.
+		c.phase = PhaseSegmentEnd
+	default:
 		c.phase = PhaseIdle
 	}
 	for i := range c.states {
