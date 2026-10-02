@@ -29,6 +29,7 @@ package control
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -45,6 +46,7 @@ const (
 	PhaseIdle     Phase = "idle"
 	PhaseRunning  Phase = "running"
 	PhaseStopping Phase = "stopping"
+	PhasePaused   Phase = "paused"
 	PhaseFaulted  Phase = "faulted"
 	PhaseDone     Phase = "done"
 )
@@ -110,12 +112,14 @@ type Controller struct {
 	ticks  int64
 
 	// safe-stop ramp state
-	stopV       []float64 // current reference velocity while stopping
-	stopQ       []float64 // reference position while stopping
-	stopSettled bool
-	endTicks    int // cycles past trajectory end
-	holdTicks   int // convergence hold counter
-	recTicks    int // recovery precondition hold counter
+	stopReason    string    // "canceled" or "paused": where settling leads
+	stopV         []float64 // current reference velocity while stopping
+	stopQ         []float64 // reference position while stopping
+	stopSettled   bool
+	stopHoldTicks int // consecutive at-rest cycles confirming a stop/pause
+	endTicks      int // cycles past trajectory end
+	holdTicks     int // convergence hold counter
+	recTicks      int // recovery precondition hold counter
 }
 
 // New constructs a controller from validated configuration.
@@ -149,6 +153,8 @@ func (c *Controller) Reset(position []float64) {
 	c.holdTicks = 0
 	c.recTicks = 0
 	c.stopSettled = false
+	c.stopHoldTicks = 0
+	c.stopReason = ""
 	for i := 0; i < c.n; i++ {
 		c.states[i] = axisState{q: position[i], targetPos: position[i], feedbackOK: true}
 		c.stopV[i] = 0
@@ -178,6 +184,8 @@ func (c *Controller) Load(tr *trajectory.Trajectory) error {
 	c.holdTicks = 0
 	c.recTicks = 0
 	c.stopSettled = false
+	c.stopHoldTicks = 0
+	c.stopReason = ""
 	for i := range c.states {
 		s := &c.states[i]
 		s.integral = 0
@@ -197,9 +205,75 @@ func (c *Controller) Cancel() {
 	}
 }
 
-func (c *Controller) beginStopLocked(_ string) {
+// Pause requests a controlled ramp-to-rest of the running move and then a
+// closed-loop hold at the stopping point. It returns false when there is no
+// running move to pause; pausing an already paused/stopping controller is a
+// harmless idempotent no-op that returns true.
+func (c *Controller) Pause() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.phase {
+	case PhaseRunning:
+		c.beginStopLocked("paused")
+		return true
+	case PhaseStopping, PhasePaused:
+		return true
+	default:
+		return false
+	}
+}
+
+// AbortPauseRamp switches a pause ramp that has not settled yet into a
+// cancellation stop. It returns false when the controller is not ramping
+// because of a pause.
+func (c *Controller) AbortPauseRamp() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != PhaseStopping || c.stopReason != "paused" {
+		return false
+	}
+	c.stopReason = "canceled"
+	return true
+}
+
+// CancelHold converts an active pause into a cancellation: the hold turns
+// into the settled tail of a safe stop, so the next tick leaves the command
+// in PhaseDone (which the service records as canceled). It returns false if
+// the controller is not in the paused phase.
+func (c *Controller) CancelHold() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != PhasePaused {
+		return false
+	}
+	c.stopReason = "canceled"
+	c.stopSettled = true
 	c.phase = PhaseStopping
+	return true
+}
+
+// Resume leaves the paused hold. It returns false unless the controller is in
+// the paused phase; the caller (service) is responsible for re-planning from
+// the measured state and loading the continuation, because the ramp-to-rest
+// leaves the axes short of the original trajectory reference.
+func (c *Controller) Resume() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != PhasePaused {
+		return false
+	}
+	// No trajectory is active while holding: the service loads the
+	// continuation next. Idle keeps the closed-loop park torque at zero (the
+	// service immediately loads or parks).
+	c.phase = PhaseIdle
+	return true
+}
+
+func (c *Controller) beginStopLocked(reason string) {
+	c.phase = PhaseStopping
+	c.stopReason = reason
 	c.stopSettled = false
+	c.stopHoldTicks = 0
 	for i := range c.states {
 		// Ramp starts from measured state (last healthy reading), never
 		// from the trajectory reference, so no position jump is commanded.
@@ -300,8 +374,22 @@ func (c *Controller) Tick(_ time.Time, measuredPosition, measuredVelocity []floa
 			return c.phase, c.fault
 		}
 		if c.stopSettled {
-			c.phase = PhaseDone
+			if c.stopReason == "paused" {
+				// Hold the stop point with the same park law; the move and its
+				// queued successors stay pending until Resume.
+				c.phase = PhasePaused
+			} else {
+				c.phase = PhaseDone
+			}
 		}
+		return c.phase, nil
+	}
+
+	if c.phase == PhasePaused {
+		// Closed-loop hold at the ramp stop point: no integral, no
+		// feed-forward, reference velocity zero. The plant keeps cycling so
+		// disturbances are countered and the axes do not drift.
+		c.pausedHoldTorqueLocked()
 		return c.phase, nil
 	}
 
@@ -382,9 +470,37 @@ func (c *Controller) computeTorquesLocked() {
 			s.targetPos = c.stopQ[i]
 			s.targetVel = c.stopV[i]
 			s.err = s.targetPos - s.q
-			// No trajectory feed-forward while ramping to rest.
+			if c.stopV[i] != 0 {
+				// While the ramp reference is moving the axes are braking.
+				// The deceleration feed-forward supplies the bulk of the
+				// braking force so the safe-deceleration ramp is actually
+				// followed, and a damping term acts on the velocity error;
+				// gravity is compensated. No position term is used: with weak
+				// actuators the measured position lags the ramp substantially
+				// and a P term toward its (ahead) endpoint would push the
+				// axes ONWARD instead of braking them.
+				s.integral = 0
+				brakeFF := -a.Inertia * c.cfg.Fault.SafeDecel * sign(c.stopV[i])
+				tau := a.GravityTorque*math.Sin(s.q) + brakeFF + a.Gains.Kd*(c.stopV[i]-s.v)
+				s.saturated = false
+				if tau > a.MaxTorque {
+					tau = a.MaxTorque
+					s.saturated = true
+				} else if tau < -a.MaxTorque {
+					tau = -a.MaxTorque
+					s.saturated = true
+				}
+				if !numeric.Finite(tau) {
+					c.enterFatalLocked(i, FaultCommandNonFinite, "stop ramp produced non-finite torque")
+					return
+				}
+				s.tauCmd = tau
+				continue
+			}
+			// Ramp at rest: park at the stop point with P/D (+ small integral)
+			// during the settle-confirmation window.
 			s.integral += numeric.Clamp(a.Gains.Ki*s.err*c.dt, -a.Gains.IntegralLimit, a.Gains.IntegralLimit)
-			tau := a.Gains.Kp*s.err + s.integral + a.Gains.Kd*(s.targetVel-s.v)
+			tau := a.GravityTorque*math.Sin(s.q) + a.Gains.Kp*s.err + s.integral + a.Gains.Kd*(s.targetVel-s.v)
 			s.saturated = false
 			if tau > a.MaxTorque {
 				tau = a.MaxTorque
@@ -394,7 +510,7 @@ func (c *Controller) computeTorquesLocked() {
 				s.saturated = true
 			}
 			if !numeric.Finite(tau) {
-				c.enterFatalLocked(i, FaultCommandNonFinite, "controller produced non-finite torque")
+				c.enterFatalLocked(i, FaultCommandNonFinite, "stop park produced non-finite torque")
 				return
 			}
 			s.tauCmd = tau
@@ -436,16 +552,20 @@ func (c *Controller) checkSaturationLocked() {
 }
 
 // tickSafeStopLocked integrates a per-axis ramp-to-zero reference at the
-// configured safe deceleration.
+// configured safe deceleration. Settled requires every ramp reference to be
+// zero AND the measured velocity to remain within tolerance for HoldTicks
+// consecutive cycles: a lone swing through v=0 under weak braking must not be
+// mistaken for rest (the axes can be re-accelerating in the opposite
+// direction on the next cycle).
 func (c *Controller) tickSafeStopLocked() {
-	allSettled := true
+	refsZero := true
 	for i := range c.states {
 		v := c.stopV[i]
 		if abs(v) < 1e-12 {
 			c.stopV[i] = 0
 			continue
 		}
-		allSettled = false
+		refsZero = false
 		dv := c.cfg.Fault.SafeDecel * c.dt
 		if abs(v) <= dv {
 			c.stopV[i] = 0
@@ -456,15 +576,21 @@ func (c *Controller) tickSafeStopLocked() {
 		lim := &c.cfg.Axes[i]
 		c.stopQ[i] = numeric.Clamp(c.stopQ[i], lim.MinPosition, lim.MaxPosition)
 	}
-	if allSettled {
+	plantResting := refsZero
+	if plantResting {
 		for i := range c.states {
 			if abs(c.states[i].v) > c.cfg.Tolerance.Velocity {
-				allSettled = false
+				plantResting = false
 				break
 			}
 		}
 	}
-	c.stopSettled = allSettled
+	if plantResting {
+		c.stopHoldTicks++
+	} else {
+		c.stopHoldTicks = 0
+	}
+	c.stopSettled = c.stopHoldTicks >= c.cfg.Tolerance.HoldTicks
 }
 
 func (c *Controller) zeroTorqueLocked() {
@@ -499,6 +625,38 @@ func (c *Controller) safeHoldTorqueLocked() {
 		}
 		if !numeric.Finite(tau) {
 			c.enterFatalLocked(i, FaultCommandNonFinite, "safe hold produced non-finite torque")
+			return
+		}
+		s.tauCmd = tau
+	}
+}
+
+// pausedHoldTorqueLocked commands pure P/D torque that parks each axis at its
+// ramp stop point (stopQ) with zero reference velocity while a move is
+// paused. It deliberately omits the integral term and trajectory
+// feed-forward so the hold is independent of how long the pause lasts.
+func (c *Controller) pausedHoldTorqueLocked() {
+	for i := 0; i < c.n; i++ {
+		a := &c.cfg.Axes[i]
+		s := &c.states[i]
+		if !s.feedbackOK {
+			// Never act on a missing encoder reading.
+			s.tauCmd = 0
+			s.saturated = false
+			continue
+		}
+		s.targetPos = c.stopQ[i]
+		s.targetVel = 0
+		s.err = c.stopQ[i] - s.q
+		tau := a.GravityTorque*math.Sin(s.q) + a.Gains.Kp*s.err - a.Gains.Kd*s.v
+		s.saturated = false
+		if tau > a.MaxTorque {
+			tau, s.saturated = a.MaxTorque, true
+		} else if tau < -a.MaxTorque {
+			tau, s.saturated = -a.MaxTorque, true
+		}
+		if !numeric.Finite(tau) {
+			c.enterFatalLocked(i, FaultCommandNonFinite, "pause hold produced non-finite torque")
 			return
 		}
 		s.tauCmd = tau

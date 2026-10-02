@@ -87,13 +87,26 @@ type Arbiter struct {
 	queue    []uint64
 	lastSeq  map[string]uint64
 	arrival  int
+	// capacity bounds the number of simultaneously pending (active + queued)
+	// commands. Zero means unbounded (used by package tests only); the motion
+	// service always constructs with its configured capacity.
+	capacity int
 }
 
-// New creates an empty arbiter.
+// New creates an empty arbiter with no pending-command cap. Production code
+// uses NewWithCapacity so an over-long queue is rejected decisively.
 func New() *Arbiter {
+	return NewWithCapacity(0)
+}
+
+// NewWithCapacity creates an empty arbiter that rejects new queued/active
+// admissions (queue_full) once pending commands reach capacity. capacity must
+// be >= 1; zero means unbounded.
+func NewWithCapacity(capacity int) *Arbiter {
 	return &Arbiter{
-		entries: map[uint64]*entry{},
-		lastSeq: map[string]uint64{},
+		entries:  map[uint64]*entry{},
+		lastSeq:  map[string]uint64{},
+		capacity: capacity,
 	}
 }
 
@@ -126,8 +139,26 @@ func (a *Arbiter) Submit(cmd *Command) (*SubmitResult, error) {
 		return &SubmitResult{State: prior.state, Duplicate: true}, nil
 	}
 	if last, ok := a.lastSeq[cmd.Entrance]; ok && cmd.Seq <= last {
+		// A rejected (including capacity-rejected) command commits no sequence
+		// number, so a client that retries with the same seq after a rejection
+		// is not permanently poisoned; genuinely stale seqs are still refused.
 		return nil, mcerr.New(mcerr.CodeStaleSequence,
 			fmt.Sprintf("entrance %s seq %d is not greater than last seen %d", cmd.Entrance, cmd.Seq, last))
+	}
+
+	// Capacity: count the active slot (running/stopping/faulted-recoverable)
+	// and the FIFO queue. A command that preempts the active one does not
+	// grow the pending count and is therefore admitted even when full.
+	if a.capacity > 0 && a.activeID != 0 {
+		active := a.entries[a.activeID]
+		if !(cmd.Priority > active.cmd.Priority) {
+			pending := 1 + len(a.queue)
+			if pending >= a.capacity {
+				return nil, mcerr.New(mcerr.CodeQueueFull,
+					fmt.Sprintf("pending command limit %d reached (1 active + %d queued); wait, cancel or preempt",
+						a.capacity, len(a.queue)))
+			}
+		}
 	}
 
 	a.arrival++
@@ -159,6 +190,24 @@ func (a *Arbiter) Submit(cmd *Command) (*SubmitResult, error) {
 	a.queue = append(a.queue, cmd.ID)
 	res.State = StateQueued
 	return res, nil
+}
+
+// CheckSeq validates an entrance sequence for an operation that does not
+// itself create a command (such as appending waypoints to an admitted path).
+// On success the sequence is committed, so the same entrance cannot later
+// reuse it for a new command. A rejected check commits nothing.
+func (a *Arbiter) CheckSeq(entrance string, seq uint64) error {
+	if entrance == "" {
+		return mcerr.New(mcerr.CodeTargetContradictory, "operation requires a non-empty entrance")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if last, ok := a.lastSeq[entrance]; ok && seq <= last {
+		return mcerr.New(mcerr.CodeStaleSequence,
+			fmt.Sprintf("entrance %s seq %d is not greater than last seen %d", entrance, seq, last))
+	}
+	a.lastSeq[entrance] = seq
+	return nil
 }
 
 // Cancel marks a command canceled. A running command moves to stopping (the
@@ -349,4 +398,20 @@ func (a *Arbiter) QueuedIDs() []uint64 {
 		return ei.arrival < ej.arrival
 	})
 	return ids
+}
+
+// PendingCount reports how many commands currently occupy the pending slots:
+// one for the active command (0 when idle) plus the FIFO queue length.
+func (a *Arbiter) PendingCount() (active, queued int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeID != 0 {
+		active = 1
+	}
+	return active, len(a.queue)
+}
+
+// Capacity returns the configured pending-command capacity (0 = unbounded).
+func (a *Arbiter) Capacity() int {
+	return a.capacity
 }

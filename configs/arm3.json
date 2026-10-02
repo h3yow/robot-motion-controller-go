@@ -53,5 +53,8 @@
     "end_grace_ticks": 60,
     "recovery_hold_ticks": 2,
     "safe_decel": 12.0
+  },
+  "queue": {
+    "capacity": 256
   }
 }

@@ -1,6 +1,7 @@
 package arbiter
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -223,5 +224,42 @@ func TestConcurrentSubmitConsistency(t *testing.T) {
 	snap := a.Snapshot()
 	if len(snap) != goroutines*per {
 		t.Fatalf("snapshot has %d entries want %d", len(snap), goroutines*per)
+	}
+}
+
+func TestCapacityBoundAndPreemption(t *testing.T) {
+	a := NewWithCapacity(2)
+	cmd := func(id uint64, ent string, p Priority) *Command {
+		return &Command{ID: id, Entrance: ent, Seq: id, Priority: p, Goal: []float64{1}}
+	}
+	if _, err := a.Submit(cmd(1, "a", PriorityNormal)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Submit(cmd(2, "b", PriorityNormal)); err != nil {
+		t.Fatal(err) // queued: 1 active + 1 queued == capacity
+	}
+	if _, err := a.Submit(cmd(3, "c", PriorityLow)); !mcerr.HasCode(err, mcerr.CodeQueueFull) {
+		t.Fatalf("third admission: want queue_full, got %v", err)
+	}
+	// Higher priority preempts: pending count unchanged, admitted.
+	res, err := a.Submit(cmd(4, "e", PriorityHigh))
+	if err != nil || res.State != StateRunning || res.PreemptedID != 1 {
+		t.Fatalf("preempt while full: res=%+v err=%v", res, err)
+	}
+	if active, queued := a.PendingCount(); active != 1 || queued != 1 {
+		t.Fatalf("pending after preempt = %d/%d", active, queued)
+	}
+}
+
+func TestCapacityUnboundedZero(t *testing.T) {
+	a := NewWithCapacity(0)
+	for i := uint64(1); i <= 100; i++ {
+		ent := fmt.Sprintf("e%d", i)
+		if _, err := a.Submit(&Command{ID: i, Entrance: ent, Seq: 1, Priority: PriorityLow, Goal: []float64{1}}); err != nil {
+			t.Fatalf("unbounded admission %d: %v", i, err)
+		}
+	}
+	if _, queued := a.PendingCount(); queued != 99 {
+		t.Fatalf("queued=%d want 99", queued)
 	}
 }

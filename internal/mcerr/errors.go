@@ -37,6 +37,9 @@ const (
 	CodeDuplicateCmd   Code = "duplicate_command"
 	CodePriorityTooLow Code = "priority_too_low"
 	CodeCommandUnknown Code = "command_unknown"
+
+	CodeQueueFull  Code = "queue_full"  // pending-command capacity exceeded
+	CodePathClosed Code = "path_closed" // append to a finished/canceled path
 )
 
 // Error is the classified error type used across all packages.

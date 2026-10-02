@@ -25,7 +25,21 @@ const (
 
 	// SupportedDOF is the only supported planar arm joint count.
 	SupportedDOF = 3
+
+	// DefaultQueueCapacity is the pending-command limit applied when a
+	// configuration omits the optional "queue" section. It is documented and
+	// exposed (not a silent runtime substitution); configurations may set an
+	// explicit capacity to override it.
+	DefaultQueueCapacity = 256
+	// MinQueueCapacity is the smallest explicitly configurable capacity; at
+	// least one active command plus one queued command must be representable.
+	MinQueueCapacity = 1
 )
+
+// QueuePolicy bounds the number of pending (active + queued) motion commands.
+type QueuePolicy struct {
+	Capacity int `json:"capacity"`
+}
 
 // PIDGains are per-axis joint-space PID gains.
 //
@@ -104,6 +118,9 @@ type Config struct {
 	Axes      []AxisConfig `json:"axes"`
 	Tolerance Tolerance    `json:"tolerance"`
 	Fault     FaultPolicy  `json:"fault"`
+	// Queue is optional; when absent the effective pending-command capacity is
+	// DefaultQueueCapacity (see QueueCapacity).
+	Queue *QueuePolicy `json:"queue,omitempty"`
 }
 
 // rawConfig avoids reflection coupling around the period wrapper.
@@ -115,6 +132,7 @@ type rawConfig struct {
 	Axes      []AxisConfig `json:"axes"`
 	Tolerance Tolerance    `json:"tolerance"`
 	Fault     FaultPolicy  `json:"fault"`
+	Queue     *QueuePolicy `json:"queue,omitempty"`
 }
 
 // Parse reads and validates a JSON configuration stream. Unknown fields are
@@ -142,6 +160,7 @@ func Parse(r io.Reader) (*Config, error) {
 		Axes:      raw.Axes,
 		Tolerance: raw.Tolerance,
 		Fault:     raw.Fault,
+		Queue:     raw.Queue,
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -259,7 +278,22 @@ func (c *Config) Validate() error {
 	if !(f.SafeDecel > 0) {
 		return mcerr.New(mcerr.CodeConfigInvalid, "fault.safe_decel must be > 0")
 	}
+	if c.Queue != nil {
+		if c.Queue.Capacity < MinQueueCapacity {
+			return mcerr.New(mcerr.CodeConfigInvalid,
+				fmt.Sprintf("queue.capacity must be >= %d, got %d", MinQueueCapacity, c.Queue.Capacity))
+		}
+	}
 	return nil
+}
+
+// QueueCapacity returns the effective pending-command capacity: the explicit
+// configured value when present, otherwise DefaultQueueCapacity.
+func (c *Config) QueueCapacity() int {
+	if c.Queue != nil {
+		return c.Queue.Capacity
+	}
+	return DefaultQueueCapacity
 }
 
 // parseVersion accepts strict "MAJOR.MINOR.PATCH" numeric form.
@@ -290,5 +324,6 @@ func (c *Config) MarshalJSON() ([]byte, error) {
 		Axes:      c.Axes,
 		Tolerance: c.Tolerance,
 		Fault:     c.Fault,
+		Queue:     c.Queue,
 	})
 }
