@@ -581,7 +581,14 @@ func (s *Service) applyResume() error {
 // essential for queued/preempting commands whose activation state differs
 // from their submission state; the same property makes pause/resume exact
 // (the continuation is replanned from the measured stop point). For paths
-// only the not-yet-reached tail is planned, stopping at every point.
+// exactly ONE leg is planned: measured state -> the next not-yet-reached
+// point (m.points[m.reached]). Planning the whole remaining tail as one
+// trajectory would reach every point physically before the controller reports
+// PhaseDone once, after which a tail replan would drag the axes BACK through
+// the already-visited middle points. One leg per arming instead makes each
+// PhaseDone correspond to exactly one waypoint arrival, so reached points are
+// never re-planned or re-visited (append / queue activation / pause-resume
+// all continue from m.points[m.reached] at the true position).
 func (s *Service) startMoveLocked(id uint64, honorPause bool) error {
 	m, ok := s.moves[id]
 	if !ok {
@@ -591,7 +598,7 @@ func (s *Service) startMoveLocked(id uint64, honorPause bool) error {
 	var tr *trajectory.Trajectory
 	var err error
 	if m.isPath {
-		tr, err = s.planTailLocked(m.points[m.reached:])
+		tr, err = s.planJointLocked(m.points[m.reached])
 	} else {
 		tr, err = s.planJointLocked(m.cmd.Goal)
 	}
@@ -612,19 +619,6 @@ func (s *Service) startMoveLocked(id uint64, honorPause bool) error {
 		s.ctrl.Pause()
 	}
 	return nil
-}
-
-// planTailLocked plans a rest-at-each-point path through goals from the
-// current measured state.
-func (s *Service) planTailLocked(goals [][]float64) (*trajectory.Trajectory, error) {
-	q, v := s.plant.State()
-	return trajectory.PlanPath(&trajectory.PathRequest{
-		StartPosition: q,
-		StartVelocity: v,
-		Waypoints:     goals,
-		Limits:        s.limits(),
-		Period:        s.cfg.Period,
-	})
 }
 
 func (s *Service) applyCancel(id uint64) error {

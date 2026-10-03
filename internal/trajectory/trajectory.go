@@ -394,6 +394,18 @@ type PathRequest struct {
 
 // PlanPath builds a trajectory visiting every waypoint in order, stopping at
 // each one. Empty duplicate consecutive waypoints are skipped.
+//
+// Consumer caveat: the intermediate rest points are INTERNAL samples of the
+// returned trajectory; there is no per-waypoint completion callback. A
+// controller consuming the whole trajectory signals completion only at the
+// final sample, after every intermediate point has already been crossed. An
+// executor that needs per-waypoint accounting, continuation after
+// pause/queue/append from the true position, and a guarantee that reached
+// points are never revisited must therefore plan ONE leg at a time
+// (measured state -> next waypoint), re-arming when that leg completes -
+// which is what the motion service does. Planning the whole remaining tail
+// as one trajectory and replanning it after the single completion signal
+// would drive the axes back through already-visited middle points.
 func PlanPath(req *PathRequest) (*Trajectory, error) {
 	if req == nil {
 		return nil, mcerr.New(mcerr.CodeTargetContradictory, "nil path request")
